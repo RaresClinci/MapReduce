@@ -8,6 +8,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <cctype>
+#include <map>
 
 using namespace std;
 
@@ -15,11 +16,20 @@ struct mapper_args {
     int id;
     queue<tuple<int, string>> *mapper_tasks;
     pthread_mutex_t *mapper_mutex;
-    queue<tuple<int, unordered_map<string, int>>> *reducer_tasks;
+    queue<tuple<int, vector<string>>> *reducer_tasks;
     pthread_mutex_t *reducer_mutex;
-    sem_t *new_task;
-    pthread_barrier_t *barrier;
+    pthread_barrier_t *mappers_done;
+    pthread_barrier_t *everyone_done;
 
+};
+
+struct reducer_args {
+    queue<tuple<int, vector<string>>> *reducer_tasks;
+    pthread_mutex_t *reducer_mutex;
+    pthread_barrier_t *everyone_done;
+    pthread_barrier_t *mappers_done;
+    unordered_map<char, map<string, vector<int>>> *agregated_list;
+    pthread_mutex_t *agregated_mutex;
 };
 
 string normalize_word(string word) {
@@ -32,6 +42,17 @@ string normalize_word(string word) {
     }
 
     return new_word;
+}
+
+void *reducer(void *args) {
+    reducer_args red_args = *(reducer_args*)args;
+
+    // waiting for mappers to finish
+    pthread_barrier_wait(red_args.mappers_done);
+
+
+
+    pthread_exit(NULL);
 }
 
 void *mapper(void *args) 
@@ -76,50 +97,55 @@ void *mapper(void *args)
         }
         fin.close();
 
+        // only adding unique words
+        vector<string> unique;
+        for (auto w = count.begin(); w != count.end(); w++) {
+            if(w->second == 1) {
+                unique.push_back(w->first);
+            }
+        }
+
         // adding the map to the reduce queue
         pthread_mutex_lock(map_args.reducer_mutex);
-        map_args.reducer_tasks->push(make_tuple(id, count));
-        sem_post(map_args.new_task);
+        map_args.reducer_tasks->push(make_tuple(id, unique));
         pthread_mutex_unlock(map_args.reducer_mutex);
     }
 
-    // waiting on a barrier so the mappers can signal the reducers that they are over
-    pthread_barrier_wait(map_args.barrier);
+    // waiting for all mappers to end, so reducers can start
+    // pthread_barrier_wait(map_args.mappers_done);
 
-    // one of the threads(the first) will signal the reducers that they can exit the function if there are no more tasks
-    if(map_args.id == 0) {
-        sem_post(map_args.new_task);
-    }
+    // waiting for everyone to be done
+    // pthread_barrier_wait(map_args.everyone_done);
    
     pthread_exit(NULL);
 
 }
 
 
-void printReducerTasks(const std::queue<std::tuple<int, std::unordered_map<std::string, int>>>& reducer_tasks) {
-    // Create a copy of the queue to process (because queues cannot be accessed directly in a loop)
-    std::queue<std::tuple<int, std::unordered_map<std::string, int>>> tasks = reducer_tasks;
 
-    // Iterate over each task in the queue
-    while (!tasks.empty()) {
-        // Get the current tuple
-        auto task = tasks.front();
-        tasks.pop(); // Remove the task from the queue
-        
-        // Extract the int and the unordered_map from the tuple
-        int number = std::get<0>(task);
-        const std::unordered_map<std::string, int>& map = std::get<1>(task);
-        
-        // Print the int followed by a colon
-        std::cout << number << ": " << std::endl;
+void printReducerTasks(std::queue<std::tuple<int, std::vector<std::string>>>& reducer_tasks) {
+    // Make a copy of the queue to avoid modifying the original queue
+    std::queue<std::tuple<int, std::vector<std::string>>> tasks_copy = reducer_tasks;
 
-        // Iterate through the unordered_map and print each key-value pair
-        for (const auto& pair : map) {
-            std::cout << "\t" << pair.first << ": " << pair.second << std::endl;
+    // Iterate through the queue
+    while (!tasks_copy.empty()) {
+        // Get the front tuple
+        auto task = tasks_copy.front();
+        tasks_copy.pop();
+
+        // Get the integer and vector of strings
+        int task_id = std::get<0>(task);
+        std::vector<std::string> task_data = std::get<1>(task);
+
+        // Print the integer followed by ":"
+        std::cout << task_id << ": \n";
+
+        // Print each string in the vector, indented with a tab
+        for (const auto& str : task_data) {
+            std::cout << "\t" << str << "\n";
         }
     }
 }
-
 
 
 int main(int argc, char **argv)
@@ -154,17 +180,27 @@ int main(int argc, char **argv)
     in.close();
 
     // task list for reducer
-    queue<tuple<int, unordered_map<string, int>>> reducer_tasks;
+    queue<tuple<int, vector<string>>> reducer_tasks;
     pthread_mutex_t reducer_mutex;
     pthread_mutex_init(&reducer_mutex, NULL);
 
     // barrier after mappers finish work
-    pthread_barrier_t barrier;
-    pthread_barrier_init(&barrier, nullptr, M);
+    pthread_barrier_t mappers_done;
+    pthread_barrier_init(&mappers_done, nullptr, M);
 
-    // semaphore so mappers signal new tasks for reducers
-    sem_t new_task;
-    sem_init(&new_task, 0, 0);
+    // barrier after everyone finishes work
+    pthread_barrier_t everyone_done;
+    pthread_barrier_init(&everyone_done, nullptr, M + R);
+
+    // map of all letters and their unique words
+    unordered_map<char, map<string, vector<int>>> agregated_list;
+    pthread_mutex_t agregated_mutex;
+    pthread_mutex_init(&agregated_mutex, NULL);
+
+    // creating a map for each letter
+    for (char l = 'a'; l <= 'z'; l++) {
+        agregated_list[l];
+    }
 
     // defining threads
     pthread_t threads[M + R];
@@ -178,8 +214,8 @@ int main(int argc, char **argv)
         map_args[i].mapper_tasks = &mapper_tasks;
         map_args[i].reducer_mutex = &reducer_mutex;
         map_args[i].reducer_tasks = &reducer_tasks;
-        map_args[i].barrier = &barrier;
-        map_args[i].new_task = &new_task;
+        map_args[i].mappers_done = &mappers_done;
+        map_args[i].everyone_done = &everyone_done;
 
 
 		r = pthread_create(&threads[i], NULL, mapper, &map_args[i]);
@@ -189,6 +225,24 @@ int main(int argc, char **argv)
 			exit(-1);
 		}
 	}
+
+    // creating reducer threads
+    reducer_args red_args[R];
+    for(i = 0; i < R; i++) {
+        red_args[i].agregated_list = &agregated_list;
+        red_args[i].agregated_mutex = &agregated_mutex;
+        red_args[i].reducer_tasks = &reducer_tasks;
+        red_args[i].reducer_mutex = &reducer_mutex;
+        red_args[i].everyone_done = &everyone_done;
+        red_args[i].mappers_done = &mappers_done;
+
+        r = pthread_create(&threads[M + i], NULL, reducer, &red_args[i]);
+
+        if (r) {
+			printf("Eroare la crearea thread-ului %d\n", i);
+			exit(-1);
+		}
+    }
 
     // joining the mapper threads
     for (i = 0; i < M; i++) {
@@ -201,11 +255,18 @@ int main(int argc, char **argv)
 		}
 	}
 
-    printReducerTasks(reducer_tasks);
+    // joining the reducers threads
+    for (i = 0; i < R; i++) {
+        void* status;
+		r = pthread_join(threads[M + i], &status);
 
-    int value;
-    sem_getvalue(&new_task, &value);
-    cout << value << endl;
+		if (r) {
+			printf("Eroare la asteptarea thread-ului %d\n", i);
+			exit(-1);
+		}
+	}
+
+    printReducerTasks(reducer_tasks);
 
 
     return 0;
