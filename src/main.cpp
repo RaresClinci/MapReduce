@@ -9,6 +9,8 @@
 #include <unordered_map>
 #include <cctype>
 #include <map>
+#include <set>
+#include <algorithm>
 
 using namespace std;
 
@@ -28,8 +30,14 @@ struct reducer_args {
     pthread_mutex_t *reducer_mutex;
     pthread_barrier_t *everyone_done;
     pthread_barrier_t *mappers_done;
-    unordered_map<char, map<string, vector<int>>> *agregated_list;
-    pthread_mutex_t *agregated_mutex;
+    unordered_map<char, unordered_map<string, set<int>>> *agregated_list;
+    pthread_mutex_t **agregated_mutex;
+    queue<char> *sort_tasks;
+    pthread_mutex_t *sort_mutex;
+    queue<char> *write_tasks;
+    pthread_mutex_t *write_mutex;
+    unordered_map<char, vector<tuple<string, set<int>>>> *sorted_list;
+    pthread_barrier_t *sort_done;
 };
 
 string normalize_word(string word) {
@@ -50,7 +58,87 @@ void *reducer(void *args) {
     // waiting for mappers to finish
     pthread_barrier_wait(red_args.mappers_done);
 
+    // adding the words to the agregated list
+    while (true) {
+         // locking the queue
+        pthread_mutex_lock(red_args.reducer_mutex);
 
+        if (red_args.reducer_tasks->empty()) {
+            // no more tasks
+            pthread_mutex_unlock(red_args.reducer_mutex);
+            break;
+        }
+
+        // picking up a task
+        tuple<int, vector<string>> task = red_args.reducer_tasks->front();
+        red_args.reducer_tasks->pop();
+
+        // unlocking the queue
+        pthread_mutex_unlock(red_args.reducer_mutex);
+
+        // extracting the info
+        int id = get<0>(task);
+        vector<string> words = get<1>(task);
+
+        // adding the words to the aggreagated list
+        for (auto& w : words) {
+            char first_letter = w.at(0);
+
+            // adding id to list
+            pthread_mutex_lock(&(*red_args.agregated_mutex)[(int)first_letter]);
+
+            red_args.agregated_list->at(first_letter)[w].insert(id);
+
+            
+            pthread_mutex_unlock(&(*red_args.agregated_mutex)[(int)first_letter]);
+        }
+    }
+
+    // waiting for aggragting to stop
+    pthread_barrier_wait(red_args.sort_done);
+    cout << "past" << endl;
+
+    // sorting the words
+    while (true) {
+        // locking the queue
+        pthread_mutex_lock(red_args.sort_mutex);
+
+        // searching for a letter with words to be sorted
+        if (red_args.sort_tasks->empty()) {
+            // no more tasks
+            pthread_mutex_unlock(red_args.sort_mutex);
+            break;
+        }
+
+        // picking up a task
+        char letter = red_args.sort_tasks->front();
+        red_args.sort_tasks->pop();
+
+        // unlocking the queue
+        pthread_mutex_unlock(red_args.sort_mutex);
+
+        // turning the map into a vector
+        for (auto it = red_args.agregated_list->at(letter).begin(); it != red_args.agregated_list->at(letter).end(); it++) {
+            string word = it->first;
+            set<int> ids = it->second;
+
+            red_args.sorted_list->at(letter).push_back(make_tuple(word, ids));
+        }
+        // sorting the vector
+        auto& vec = red_args.sorted_list->at(letter);
+
+        sort(vec.begin(), vec.end(), [](const auto& a, const auto& b) {
+            if(get<1>(a).size() != get<1>(b).size()) {
+                return get<1>(a).size() > get<1>(b).size();
+            } else {
+                return get<0>(a) < get<0>(b);
+            } 
+        });
+
+    }
+
+    // waiting for everyone to finish
+    pthread_barrier_wait(red_args.everyone_done);
 
     pthread_exit(NULL);
 }
@@ -112,10 +200,10 @@ void *mapper(void *args)
     }
 
     // waiting for all mappers to end, so reducers can start
-    // pthread_barrier_wait(map_args.mappers_done);
+    pthread_barrier_wait(map_args.mappers_done);
 
     // waiting for everyone to be done
-    // pthread_barrier_wait(map_args.everyone_done);
+    pthread_barrier_wait(map_args.everyone_done);
    
     pthread_exit(NULL);
 
@@ -143,6 +231,31 @@ void printReducerTasks(std::queue<std::tuple<int, std::vector<std::string>>>& re
         // Print each string in the vector, indented with a tab
         for (const auto& str : task_data) {
             std::cout << "\t" << str << "\n";
+        }
+    }
+}
+
+void printSortedList(const std::unordered_map<char, std::vector<std::tuple<std::string, std::set<int>>>>& sorted_list) {
+    // Iterate through the outer unordered_map
+    for (const auto& outer_it : sorted_list) {
+        char letter = outer_it.first; // Access the letter
+        const auto& vec = outer_it.second; // Access the vector of tuples
+
+        // Print the letter followed by ":"
+        std::cout << letter << ":\n";
+
+        // Iterate through the vector of tuples
+        for (const auto& tuple : vec) {
+            const std::string& word = std::get<0>(tuple);   // Access the word from the tuple
+            const auto& numbers = std::get<1>(tuple);       // Access the set of numbers from the tuple
+
+            // Print the word indented with one tab
+            std::cout << "\t" << word << ":\n";
+
+            // Iterate through the set of numbers
+            for (const auto& num : numbers) {
+                std::cout << "\t\t" << num << "\n"; // Access and print each number
+            }
         }
     }
 }
@@ -193,13 +306,40 @@ int main(int argc, char **argv)
     pthread_barrier_init(&everyone_done, nullptr, M + R);
 
     // map of all letters and their unique words
-    unordered_map<char, map<string, vector<int>>> agregated_list;
-    pthread_mutex_t agregated_mutex;
-    pthread_mutex_init(&agregated_mutex, NULL);
+    unordered_map<char, unordered_map<string, set<int>>> agregated_list;
+    pthread_mutex_t agregated_mutex['z' + 1];
+    for (char l = 'a'; l <= 'z'; l++)
+        pthread_mutex_init(&agregated_mutex[(int)l], NULL);
 
     // creating a map for each letter
     for (char l = 'a'; l <= 'z'; l++) {
         agregated_list[l];
+    }
+
+    // sort queue
+    queue<char> sort_tasks;
+    pthread_mutex_t sort_mutex;
+    pthread_mutex_init(&sort_mutex, NULL);
+
+    // barrier after everyone finishes sorting
+    pthread_barrier_t sort_done;
+    pthread_barrier_init(&sort_done, nullptr, R);
+
+    // write queue
+    queue<char> write_tasks;
+    pthread_mutex_t write_mutex;
+    pthread_mutex_init(&write_mutex, NULL);
+
+    // adding tasks to sort and write
+    for(char l = 'a'; l <= 'z'; l++) {
+        sort_tasks.push(l);
+        write_tasks.push(l);
+    }
+
+    // sorted list
+    unordered_map<char, vector<tuple<string, set<int>>>> sorted_list;
+    for (char l = 'a'; l <= 'z'; l++) {
+        sorted_list[l];
     }
 
     // defining threads
@@ -230,11 +370,17 @@ int main(int argc, char **argv)
     reducer_args red_args[R];
     for(i = 0; i < R; i++) {
         red_args[i].agregated_list = &agregated_list;
-        red_args[i].agregated_mutex = &agregated_mutex;
+        red_args[i].agregated_mutex = (pthread_mutex_t**)&agregated_mutex;
         red_args[i].reducer_tasks = &reducer_tasks;
         red_args[i].reducer_mutex = &reducer_mutex;
         red_args[i].everyone_done = &everyone_done;
         red_args[i].mappers_done = &mappers_done;
+        red_args[i].sort_tasks = &sort_tasks;
+        red_args[i].sort_mutex = &sort_mutex;
+        red_args[i].sort_tasks = &write_tasks;
+        red_args[i].sort_mutex = &write_mutex;
+        red_args[i].sorted_list = &sorted_list;
+        red_args[i].sort_done = &sort_done;
 
         r = pthread_create(&threads[M + i], NULL, reducer, &red_args[i]);
 
@@ -266,7 +412,8 @@ int main(int argc, char **argv)
 		}
 	}
 
-    printReducerTasks(reducer_tasks);
+    // printReducerTasks(reducer_tasks);
+    printSortedList(sorted_list);
 
 
     return 0;
