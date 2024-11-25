@@ -37,6 +37,7 @@ struct reducer_args {
     queue<char> *write_tasks;
     pthread_mutex_t *write_mutex;
     unordered_map<char, vector<tuple<string, set<int>>>> *sorted_list;
+    pthread_barrier_t *agg_done;
     pthread_barrier_t *sort_done;
 };
 
@@ -57,6 +58,8 @@ void *reducer(void *args) {
 
     // waiting for mappers to finish
     pthread_barrier_wait(red_args.mappers_done);
+    
+    cout << "here" << endl;
 
     // adding the words to the agregated list
     while (true) {
@@ -82,21 +85,24 @@ void *reducer(void *args) {
 
         // adding the words to the aggreagated list
         for (auto& w : words) {
-            char first_letter = w.at(0);
+            if (w.length() > 0) {
+                char first_letter = w.at(0);
 
-            // adding id to list
-            pthread_mutex_lock(&(*red_args.agregated_mutex)[(int)first_letter]);
+                // adding id to list
+                pthread_mutex_lock(&(*red_args.agregated_mutex)[(int)first_letter]);
 
-            red_args.agregated_list->at(first_letter)[w].insert(id);
+                red_args.agregated_list->at(first_letter)[w].insert(id);
 
-            
-            pthread_mutex_unlock(&(*red_args.agregated_mutex)[(int)first_letter]);
+                
+                pthread_mutex_unlock(&(*red_args.agregated_mutex)[(int)first_letter]);
+            }
         }
     }
+    
+    cout << "here1" << endl;
 
     // waiting for aggragting to stop
-    pthread_barrier_wait(red_args.sort_done);
-    cout << "past" << endl;
+    pthread_barrier_wait(red_args.agg_done);
 
     // sorting the words
     while (true) {
@@ -136,6 +142,61 @@ void *reducer(void *args) {
         });
 
     }
+
+    
+    cout << "here2" << endl;
+    // waiting for everyone to finish sorting
+    pthread_barrier_wait(red_args.sort_done);
+
+    // writing
+    while(true) {
+        // locking the queue
+        pthread_mutex_lock(red_args.write_mutex);
+
+        // searching for a letter with words to be sorted
+        if (red_args.write_tasks->empty()) {
+            // no more tasks
+            pthread_mutex_unlock(red_args.write_mutex);
+            break;
+        }
+
+        // picking up a task
+        char letter = red_args.write_tasks->front();
+        red_args.write_tasks->pop();
+
+        // unlocking the queue
+        pthread_mutex_unlock(red_args.write_mutex);
+
+        string file_name = std::string(1, letter) + ".txt";
+
+        ofstream fout(file_name);
+        vector<tuple<string, set<int>>> letter_list = red_args.sorted_list->at(letter);
+
+        for (auto& entry : letter_list) {
+            string& word = get<0>(entry);
+            set<int> files = get<1>(entry);
+
+            fout << word << ":[";
+            bool first = true;
+            for (auto& file : files) {
+                // placing spaces between words
+                if (first) {
+                    first = false;
+                } else {
+                    fout << " ";
+                }
+
+                // writing the file index
+                fout << file;
+            }
+            fout << "]" << endl;
+        }
+
+        fout.close();
+    }
+
+    
+    cout << "here3" << endl;
 
     // waiting for everyone to finish
     pthread_barrier_wait(red_args.everyone_done);
@@ -188,9 +249,7 @@ void *mapper(void *args)
         // only adding unique words
         vector<string> unique;
         for (auto w = count.begin(); w != count.end(); w++) {
-            if(w->second == 1) {
-                unique.push_back(w->first);
-            }
+            unique.push_back(w->first);
         }
 
         // adding the map to the reduce queue
@@ -299,7 +358,7 @@ int main(int argc, char **argv)
 
     // barrier after mappers finish work
     pthread_barrier_t mappers_done;
-    pthread_barrier_init(&mappers_done, nullptr, M);
+    pthread_barrier_init(&mappers_done, nullptr, M + R);
 
     // barrier after everyone finishes work
     pthread_barrier_t everyone_done;
@@ -321,9 +380,9 @@ int main(int argc, char **argv)
     pthread_mutex_t sort_mutex;
     pthread_mutex_init(&sort_mutex, NULL);
 
-    // barrier after everyone finishes sorting
-    pthread_barrier_t sort_done;
-    pthread_barrier_init(&sort_done, nullptr, R);
+    // barrier after everyone finishes aggregating
+    pthread_barrier_t agg_done;
+    pthread_barrier_init(&agg_done, nullptr, R);
 
     // write queue
     queue<char> write_tasks;
@@ -341,6 +400,10 @@ int main(int argc, char **argv)
     for (char l = 'a'; l <= 'z'; l++) {
         sorted_list[l];
     }
+
+    // barrier after everyone finishes sorting
+    pthread_barrier_t sort_done;
+    pthread_barrier_init(&sort_done, nullptr, R);
 
     // defining threads
     pthread_t threads[M + R];
@@ -377,9 +440,10 @@ int main(int argc, char **argv)
         red_args[i].mappers_done = &mappers_done;
         red_args[i].sort_tasks = &sort_tasks;
         red_args[i].sort_mutex = &sort_mutex;
-        red_args[i].sort_tasks = &write_tasks;
-        red_args[i].sort_mutex = &write_mutex;
+        red_args[i].write_tasks = &write_tasks;
+        red_args[i].write_mutex = &write_mutex;
         red_args[i].sorted_list = &sorted_list;
+        red_args[i].agg_done = &agg_done;
         red_args[i].sort_done = &sort_done;
 
         r = pthread_create(&threads[M + i], NULL, reducer, &red_args[i]);
@@ -412,8 +476,49 @@ int main(int argc, char **argv)
 		}
 	}
 
+    // destroying mutexes and barriers
+//     struct mapper_args {
+//     int id;
+//     queue<tuple<int, string>> *mapper_tasks;
+//     pthread_mutex_t *mapper_mutex;
+//     queue<tuple<int, vector<string>>> *reducer_tasks;
+//     pthread_mutex_t *reducer_mutex;
+//     pthread_barrier_t *mappers_done;
+//     pthread_barrier_t *everyone_done;
+
+// };
+
+// struct reducer_args {
+//     queue<tuple<int, vector<string>>> *reducer_tasks;
+//     pthread_mutex_t *reducer_mutex;
+//     pthread_barrier_t *everyone_done;
+//     pthread_barrier_t *mappers_done;
+//     unordered_map<char, unordered_map<string, set<int>>> *agregated_list;
+//     pthread_mutex_t **agregated_mutex;
+//     queue<char> *sort_tasks;
+//     pthread_mutex_t *sort_mutex;
+//     queue<char> *write_tasks;
+//     pthread_mutex_t *write_mutex;
+//     unordered_map<char, vector<tuple<string, set<int>>>> *sorted_list;
+//     pthread_barrier_t *agg_done;
+//     pthread_barrier_t *sort_done;
+// };
+
+    pthread_mutex_destroy(&mapper_mutex);
+    pthread_mutex_destroy(&reducer_mutex);
+    pthread_mutex_destroy(&reducer_mutex);
+    pthread_mutex_destroy(&sort_mutex);
+    pthread_mutex_destroy(&write_mutex);
+    for(auto& mutex : agregated_mutex) {
+        pthread_mutex_destroy(&mutex);
+    }
+    pthread_barrier_destroy(&mappers_done);
+    pthread_barrier_destroy(&everyone_done);
+    pthread_barrier_destroy(&agg_done);
+    pthread_barrier_destroy(&sort_done);
+
     // printReducerTasks(reducer_tasks);
-    printSortedList(sorted_list);
+    // printSortedList(sorted_list);
 
 
     return 0;
